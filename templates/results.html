@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analysis Results</title>
+    
+    <!-- Include the same stylesheets from index.html -->
+    <link href="static/img/favicon.png" rel="icon">
+    <link href="static/vendor/bootstrap/css/bootstrap.min.css" rel="stylesheet">
+    <link href="static/vendor/bootstrap-icons/bootstrap-icons.css" rel="stylesheet">
+    <link href="static/vendor/aos/aos.css" rel="stylesheet">
+    <link href="static/vendor/glightbox/css/glightbox.min.css" rel="stylesheet">
+    <link href="static/vendor/swiper/swiper-bundle.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/main.css') }}" rel="stylesheet">
+</head>
+
+<body class="results-page">
+    <main class="main">
+        <section id="results" class="hero section dark-background">
+            <div class="container text-center">
+                <h1>Training Progress</h1>
+                
+                <!-- Progress bar -->
+                <div class="progress-container mx-auto" style="width: 100%; max-width: 500px; background-color: #f3f3f3; border-radius: 25px;">
+                    <div id="progress-bar" style="width: 0%; height: 30px; background-color: #4caf50; border-radius: 25px;"></div>
+                </div>
+                <p id="progress-text">0%</p>
+
+                <!-- Start training button -->
+                 
+                <button id="start-training" class="btn btn-primary">Start Training</button>
+
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
+                <script>
+                    const socket = io.connect('http://127.0.0.1:5000');
+                    
+                    document.getElementById('start-training').addEventListener('click', function() {
+                        socket.emit('start_training');
+                    });
+
+                    socket.on('progress_update', function(data) {
+                        const progressBar = document.getElementById('progress-bar');
+                        const progressText = document.getElementById('progress-text');
+                        const progressValue = data.progress;
+
+                        progressBar.style.width = progressValue + '%';
+                        progressText.textContent = progressValue.toFixed(2) + '%';
+                    });
+
+                    socket.on('training_complete', function(data) {
+                        const resultsDiv = document.getElementById('results');
+                        resultsDiv.innerHTML = `
+                            <h2>Final Results</h2>
+                            <p>Precision 0: ${data.precision_0 * 100.0}%</p>
+                            <p>Recall 0: ${data.recall_0 * 100.0}%</p>
+                            <p>F1-Score 0: ${data.f1_score_0 * 100.0}%</p>
+                            <p>Precision 1: ${data.precision_1 * 100.0}%</p>
+                            <p>Recall 1: ${data.recall_1 * 100.0}%</p>
+                            <p>F1-Score 1: ${data.f1_score_1 * 100.0}%</p>
+                            <p>Accuracy: ${data.accuracy * 100.0}%</p>
+                        `;
+                    });
+                </script>
+            </div>
+
+            <div class="container text-center mt-5">
+                <h1>Analysis Results</h1>
+                <div id="results"></div>
+                <a href="/" class="btn btn-primary mt-3">Back to Home</a>
+            </div>
+        </section>
+    </main>
+
+    <!-- Include the same JavaScript files from index.html -->
+    <script src="static/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+    <script src="static/vendor/aos/aos.js"></script>
+    <script src="static/vendor/glightbox/js/glightbox.min.js"></script>
+    <script src="static/vendor/swiper/swiper-bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}" defer></script>
+</body>
+</html>
