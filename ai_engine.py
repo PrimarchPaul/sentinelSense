@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Subset, random_split
 import pandas as pd
+
 import numpy as np
 import os
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold  # Changed to StratifiedKFold
 import joblib
 import matplotlib.pyplot as plt
 from packaging import version
@@ -16,6 +17,8 @@ from flask import Flask, request, render_template, redirect, url_for, flash, sen
 from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO, emit
 import time  # Simulating training time, replace with your actual training code
+
+torch.backends.cudnn.benchmark = True
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -34,20 +37,22 @@ socketio = SocketIO(app)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 seq_length = 5
-batch_size = 64
+batch_size = 256  # Adjusted batch size
 hidden_size = 128
 num_layers = 2
-learning_rate = 0.001
+learning_rate = 0.01
+k_folds = 3
+epochs = 25  # Updated epochs to match your latest training logs
 
 # Define the LSTM-based neural network model
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0.5):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-        # LSTM layer
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        # LSTM layer with dropout
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
 
         # Fully connected output layer
         self.fc = nn.Linear(hidden_size, output_size)
@@ -86,11 +91,11 @@ class NetworkTrafficClassifier:
         self,
         model_path,
         scaler_path,
-        seq_length=5,
-        batch_size=128,
-        hidden_size=128,
-        num_layers=3,
-        learning_rate=0.0005
+        seq_length,
+        batch_size,
+        hidden_size,
+        num_layers,
+        learning_rate
     ):
         self.data_path = None  # Will be set later
         self.model_path = model_path
@@ -102,6 +107,12 @@ class NetworkTrafficClassifier:
         self.learning_rate = learning_rate
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Print device information only once
+        if torch.cuda.is_available():
+            print(f"GPU is available: {torch.cuda.get_device_name(0)}")
+        else:
+            print("GPU is not available, using CPU")
 
         # Load the scaler
         if os.path.exists(self.scaler_path):
@@ -194,6 +205,10 @@ class NetworkTrafficClassifier:
             self.class_weights = self.class_weights.to(self.device)
             self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
 
+            # Save the scaler
+            joblib.dump(self.scaler, self.scaler_path)
+            print("Scaler saved to file.")
+
     def init_model(self):
         # Initialize model
         if self.is_training:
@@ -215,18 +230,28 @@ class NetworkTrafficClassifier:
             print("Model file not found. Initializing a new model.")
             self.model.apply(init_weights)
 
-        # Initialize optimizer
+        # Initialize optimizer with weight decay for regularization
         if self.is_training:
-            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
 
-    def train(self, epochs=10):
+    def reset_model(self):
+        # Reinitialize the model
+        self.model = LSTMModel(self.input_size, self.hidden_size, self.output_size, num_layers=self.num_layers)
+        self.model.to(self.device)
+        self.model.apply(init_weights)
+        # Reinitialize the optimizer
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        print("Model and optimizer have been reinitialized.")
+
+    # Updated train method without early stopping
+    def train(self, epochs=10, progress_callback=None):
         best_val_loss = float('inf')
         for epoch in range(epochs):
             self.model.train()
             running_loss = 0.0
             for X_batch, y_batch in self.train_loader:
-                X_batch = X_batch.to(self.device)
-                y_batch = y_batch.to(self.device)
+                X_batch = X_batch.to(self.device, non_blocking=True)
+                y_batch = y_batch.to(self.device, non_blocking=True)
 
                 self.optimizer.zero_grad()
 
@@ -246,8 +271,8 @@ class NetworkTrafficClassifier:
             y_pred = []
             with torch.no_grad():
                 for X_batch, y_batch in self.val_loader:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.to(self.device)
+                    X_batch = X_batch.to(self.device, non_blocking=True)
+                    y_batch = y_batch.to(self.device, non_blocking=True)
 
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
@@ -259,7 +284,7 @@ class NetworkTrafficClassifier:
             avg_val_loss = val_running_loss / len(self.val_loader)
             val_accuracy = (np.array(y_pred) == np.array(y_true)).mean()
 
-            # Save the model if validation loss improved
+            # Optionally save the best model
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 self.save_model()
@@ -270,34 +295,24 @@ class NetworkTrafficClassifier:
                   f"Val Loss: {avg_val_loss:.4f}, "
                   f"Val Accuracy: {val_accuracy:.4f}")
 
+            # Emit progress update
+            if progress_callback:
+                progress_callback()
+
     def evaluate(self):
-        global precision_0
-        global precision_1
-        global recall_0
-        global recall_1
-        global f1_score_0
-        global f1_score_1
-        global accuracy
         self.model.eval()
         y_true = []
         y_pred = []
         with torch.no_grad():
             for X_batch, y_batch in self.test_loader:
-                X_batch = X_batch.to(self.device)
-                y_batch = y_batch.to(self.device)
+                X_batch = X_batch.to(self.device, non_blocking=True)
+                y_batch = y_batch.to(self.device, non_blocking=True)
 
                 outputs = self.model(X_batch)
                 _, predicted = torch.max(outputs, 1)
                 y_true.extend(y_batch.cpu().numpy())
                 y_pred.extend(predicted.cpu().numpy())
         report = classification_report(y_true, y_pred, zero_division=0, output_dict=True)
-        accuracy = report['accuracy']
-        precision_0 = report['0']['precision']
-        precision_1 = report['1']['precision']
-        recall_0 = report['0']['recall']
-        recall_1 = report['1']['recall']
-        f1_score_0 = report['0']['f1-score']
-        f1_score_1 = report['1']['f1-score']
         print(report)
         return report
 
@@ -348,8 +363,8 @@ class NetworkTrafficClassifier:
         y_pred = []
         with torch.no_grad():
             for X_batch, y_batch in self.test_loader:
-                X_batch = X_batch.to(self.device)
-                y_batch = y_batch.to(self.device)
+                X_batch = X_batch.to(self.device, non_blocking=True)
+                y_batch = y_batch.to(self.device, non_blocking=True)
                 outputs = self.model(X_batch)
                 _, predicted = torch.max(outputs, 1)
                 y_true.extend(y_batch.cpu().numpy())
@@ -359,24 +374,30 @@ class NetworkTrafficClassifier:
         disp.plot()
         plt.show()
 
-    def k_fold_cross_validation(self, k=5, epochs=10):
-        # Initialize k-fold
-        kfold = KFold(n_splits=k, shuffle=True, random_state=42)
+    def k_fold_cross_validation(self, k=5, epochs=10, progress_callback=None):
+        # Initialize StratifiedKFold for class imbalance
+        kfold = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
 
         fold_results = []
 
+        X = self.X_sequences.numpy()
+        y = self.y_sequences.numpy()
+
+        total_steps = k * epochs
+        current_step = 0
+
         # Start k-fold cross-validation
-        for fold, (train_idx, test_idx) in enumerate(kfold.split(self.dataset)):
+        for fold, (train_idx, test_idx) in enumerate(kfold.split(X, y)):
             print(f"FOLD {fold+1}")
             print("------------------------------")
 
             # Split data into training and validation sets
-            train_subsampler = Subset(self.dataset, train_idx)
-            test_subsampler = Subset(self.dataset, test_idx)
+            train_subsampler = TensorDataset(torch.tensor(X[train_idx]), torch.tensor(y[train_idx]))
+            test_subsampler = TensorDataset(torch.tensor(X[test_idx]), torch.tensor(y[test_idx]))
 
-            # Dataloaders for training and validation
-            train_loader = DataLoader(train_subsampler, batch_size=self.batch_size, shuffle=True)
-            test_loader = DataLoader(test_subsampler, batch_size=self.batch_size, shuffle=False)
+            # Dataloaders for training and validation with pin_memory for non_blocking transfers
+            train_loader = DataLoader(train_subsampler, batch_size=self.batch_size, shuffle=True, pin_memory=True)
+            test_loader = DataLoader(test_subsampler, batch_size=self.batch_size, shuffle=False, pin_memory=True)
 
             # Model initialization
             input_size = self.input_size
@@ -385,18 +406,23 @@ class NetworkTrafficClassifier:
             model.to(self.device)
             model.apply(init_weights)
 
-            # Initialize optimizer and loss function
-            class_weights = self.class_weights.to(self.device)
+            # Recompute class weights for this fold
+            class_weights = compute_class_weight(
+                class_weight='balanced',
+                classes=np.unique(y),
+                y=y[train_idx]
+            )
+            class_weights = torch.tensor(class_weights, dtype=torch.float32).to(self.device)
             criterion = nn.CrossEntropyLoss(weight=class_weights)
-            optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
+            optimizer = optim.Adam(model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
 
             # Train the model
             for epoch in range(epochs):
                 model.train()
                 running_loss = 0.0
                 for X_batch, y_batch in train_loader:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.to(self.device)
+                    X_batch = X_batch.to(self.device, non_blocking=True)
+                    y_batch = y_batch.to(self.device, non_blocking=True)
 
                     optimizer.zero_grad()
 
@@ -410,14 +436,21 @@ class NetworkTrafficClassifier:
                 avg_loss = running_loss / len(train_loader)
                 print(f"Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.4f}")
 
+                # Update progress
+                current_step += 1
+                if progress_callback:
+                    # Calculate the progress percentage for k-folds (0% to 50%)
+                    kfold_progress = (current_step / total_steps) * 50
+                    progress_callback(kfold_progress)
+
             # Evaluate on the test set
             model.eval()
             y_true = []
             y_pred = []
             with torch.no_grad():
                 for X_batch, y_batch in test_loader:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.to(self.device)
+                    X_batch = X_batch.to(self.device, non_blocking=True)
+                    y_batch = y_batch.to(self.device, non_blocking=True)
 
                     outputs = model(X_batch)
                     _, predicted = torch.max(outputs, 1)
@@ -447,13 +480,6 @@ def initialize_classifier():
     global hidden_size
     global num_layers
     global learning_rate
-
-    # Set model parameters
-    #seq_length = 5
-    #batch_size = 64
-    #hidden_size = 128
-    #num_layers = 3
-    #learning_rate = 0.0005
 
     # Define model and scaler paths
     model_name = f"model_layers_{num_layers}.pth"
@@ -525,40 +551,83 @@ def upload_file():
         flash('Invalid file format, please upload a CSV.')
         return redirect('/')
     
-# Simulated training process with progress updates
+# Training process with progress updates
 @socketio.on('start_training')
 def handle_training():
-    global precision_0
-    global precision_1
-    global recall_0
-    global recall_1
-    global f1_score_0
-    global f1_score_1
-    global accuracy
     global batch_size
-    total_steps = 100  # Replace this with actual number of training steps
+    global k_folds
+    global epochs
 
-    k_folds = 5
-    epochs = 10
-    fold_results = classifier.k_fold_cross_validation(k = k_folds, epochs=epochs)
+    total_progress = 100
+    progress = 0
+
+    def progress_callback(new_progress=None):
+        nonlocal progress
+        if new_progress is not None:
+            progress = new_progress
+        else:
+            progress += (1 / total_steps) * 100
+        if progress > 100:
+            progress = 100
+        socketio.emit('progress_update', {'progress': progress})
+
+    total_kfold_steps = k_folds * epochs
+    total_training_steps = epochs
+    total_steps = total_kfold_steps + total_training_steps
+
+    # Variables to track progress
+    current_step = 0
+
+    # K-Fold Progress Callback
+    def kfold_progress(kfold_progress_percentage):
+        progress_callback(kfold_progress_percentage)
+
+    # Perform k-fold cross-validation
+    fold_results = classifier.k_fold_cross_validation(
+        k=k_folds, epochs=epochs, progress_callback=kfold_progress
+    )
+
+    # Reinitialize the model before final training
+    classifier.reset_model()
+
+    # Split dataset into training, validation, and test sets
     train_size = int(0.7 * len(classifier.dataset))
     val_size = int(0.15 * len(classifier.dataset))
     test_size = len(classifier.dataset) - train_size - val_size
-    classifier.train_dataset, classifier.val_dataset, classifier.test_dataset = random_split(classifier.dataset, [train_size, val_size, test_size])
-    
-    # Create data loaders
-    classifier.train_loader = DataLoader(classifier.train_dataset, batch_size=batch_size, shuffle=True)
-    classifier.val_loader = DataLoader(classifier.val_dataset, batch_size=batch_size, shuffle=False)
-    classifier.test_loader = DataLoader(classifier.test_dataset, batch_size=batch_size, shuffle=False)
-    
-    for step in range(total_steps):
-        # Train the model
-        classifier.train(epochs=epochs)
-        progress = (step + 1) / total_steps * 100
-        socketio.emit('progress_update', {'progress': progress})  # Send progress to client
-        #print(f'Training step {step+1}/{total_steps} completed, progress: {progress:.2f}%')
+    classifier.train_dataset, classifier.val_dataset, classifier.test_dataset = random_split(
+        classifier.dataset, [train_size, val_size, test_size]
+    )
 
-    classifier.evaluate()
+    # Create data loaders with pin_memory
+    classifier.train_loader = DataLoader(classifier.train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    classifier.val_loader = DataLoader(classifier.val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+    classifier.test_loader = DataLoader(classifier.test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+
+    # Define progress callback function for final training
+    def training_progress_callback():
+        nonlocal current_step
+        current_step += 1
+        # Calculate the progress percentage for final training (50% to 100%)
+        training_progress = 50 + (current_step / total_training_steps) * 50
+        progress_callback(training_progress)
+
+    # Reset current_step for final training
+    current_step = 0
+
+    # Train the model
+    classifier.train(epochs=epochs, progress_callback=training_progress_callback)
+
+    # Evaluate the model
+    final_report = classifier.evaluate()
+
+    # Extract metrics
+    accuracy = final_report['accuracy']
+    precision_0 = final_report['0']['precision']
+    precision_1 = final_report['1']['precision']
+    recall_0 = final_report['0']['recall']
+    recall_1 = final_report['1']['recall']
+    f1_score_0 = final_report['0']['f1-score']
+    f1_score_1 = final_report['1']['f1-score']
 
     final_results = {
         'precision_0': precision_0,
@@ -569,8 +638,8 @@ def handle_training():
         'f1_score_1': f1_score_1,
         'accuracy': accuracy
     }
-    socketio.emit('training_complete', final_results)  # Emit results to the client
-    
+    socketio.emit('training_complete', final_results)
+
 @app.route('/')
 def home():
     return render_template('index.html')
